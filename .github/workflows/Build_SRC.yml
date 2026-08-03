@@ -1,0 +1,29 @@
+name: Build lmk_engine
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'src/lmk_engine.c'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up NDK
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r26d
+
+      - name: Compile for aarch64
+        run: |
+          ${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android26-clang \
+            -O2 -Wall -Wextra -static -o lmk_engine src/lmk_engine.c -lm
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: lmk_engine-aarch64
+          path: lmk_engine
