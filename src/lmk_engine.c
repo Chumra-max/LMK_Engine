@@ -845,7 +845,7 @@ static void zram_setup(void) {
             if (cpus < 1) cpus = 4;
             char buf[16]; snprintf(buf, sizeof(buf), "%d\n", cpus);
             zram_sysfs_wr(g_zram_sys, "max_comp_streams", buf);
-            zram_sysfs_wr(g_zram_sys, "comp_algorithm", "lz4\n");
+            zram_sysfs_wr(g_zram_sys, "comp_algorithm", "zstd\n");
             usleep(50000);
             char sval[32]; snprintf(sval, sizeof(sval), "%ld\n", target_bytes);
             zram_sysfs_wr(g_zram_sys, "disksize", sval);
