@@ -17,10 +17,11 @@ jobs:
         uses: nttld/setup-ndk@v1
         with:
           ndk-version: r26d
+          add-to-path: true
 
       - name: Compile for aarch64
         run: |
-          aarch64-linux-android26-clang \
+          ${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android26-clang \
             -O2 -Wall -Wextra -static -o lmk_engine src/lmk_engine.c -lm
 
       - name: Upload binary
