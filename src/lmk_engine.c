@@ -1015,15 +1015,130 @@ static bool is_doze_active(void) {
 }
 
 /* ================================================================
- *  LMKD MINFREE CLEANUP — from reference engine fmiop()
- *  Prevents stock LMKD from overriding our kill thresholds.
+ *  LMKD GUARD / PROPERTY QUARANTINE
+ *
+ *  Android lmkd reads persist.device_config.lmkd_native.* first and
+ *  falls back to ro.lmk.*.  Merely clearing sys.lmk.minfree_levels is
+ *  therefore insufficient on modern Android.  This guard makes the
+ *  stock lmkd decision inputs effectively inert while leaving the
+ *  daemon itself running, so a real kernel OOM condition can still be
+ *  handled by Android instead of trying to disable the safety net.
+ *
+ *  Values are chosen from AOSP semantics:
+ *    - low/medium/critical = 1001: no eligible oom_score_adj (max=1000)
+ *    - use_minfree_levels = false: disable legacy minfree decisions
+ *    - swap_free_low_percentage = 0: swap-low condition cannot trigger
+ *    - swap_util_max = 100: swap-util kill branch is disabled
+ *    - very high thrashing/PSI thresholds: pressure signals are ignored
+ *    - kill_timeout_ms = 60000: prevents rapid back-to-back lmkd kills
+ *
+ *  The persist.device_config values are set too because AOSP gives them
+ *  precedence over ro.lmk.*.  A reinit is sent only after the values are
+ *  applied.
  * ================================================================ */
+#define LMKD_GUARD_THRASHING   1000000000
+#define LMKD_GUARD_PSI_MS      2147483647
+#define LMKD_GUARD_TIMEOUT_MS  60000
+
+static const char *lmkd_resetprop_path(void) {
+    if (access("/system/bin/resetprop", X_OK) == 0)
+        return "/system/bin/resetprop";
+    if (access("/data/adb/magisk/resetprop", X_OK) == 0)
+        return "/data/adb/magisk/resetprop";
+    return NULL;
+}
+
+static void lmkd_neutralize_props(void) {
+    const char *rp = lmkd_resetprop_path();
+    if (!rp) {
+        logw("LMKD guard: resetprop unavailable; cannot override stock LMKD props");
+        return;
+    }
+
+    /*
+     * resetprop -n bypasses property_service triggers.  Stage the full
+     * configuration first, then issue exactly one lmkd.reinit request.
+     */
+    static const struct {
+        const char *name;
+        const char *value;
+    } guard_props[] = {
+        { "ro.lmk.use_minfree_levels", "false" },
+        { "ro.lmk.low", "1001" },
+        { "ro.lmk.medium", "1001" },
+        { "ro.lmk.critical", "1001" },
+        { "ro.lmk.critical_upgrade", "false" },
+        { "ro.lmk.upgrade_pressure", "100" },
+        { "ro.lmk.downgrade_pressure", "100" },
+        { "ro.lmk.kill_heaviest_task", "false" },
+        { "ro.lmk.kill_timeout_ms", "60000" },
+        { "ro.lmk.pressure_after_kill_min_score", "1001" },
+        { "ro.lmk.swap_free_low_percentage", "0" },
+        { "ro.lmk.thrashing_limit", "1000000000" },
+        { "ro.lmk.thrashing_limit_decay", "100" },
+        { "ro.lmk.thrashing_limit_critical", "1000000000" },
+        { "ro.lmk.swap_util_max", "100" },
+        { "ro.lmk.psi_partial_stall_ms", "2147483647" },
+        { "ro.lmk.psi_complete_stall_ms", "2147483647" },
+        { "ro.lmk.stall_limit_critical", "2147483647" },
+
+        { "persist.device_config.lmkd_native.use_minfree_levels", "false" },
+        { "persist.device_config.lmkd_native.low", "1001" },
+        { "persist.device_config.lmkd_native.medium", "1001" },
+        { "persist.device_config.lmkd_native.critical", "1001" },
+        { "persist.device_config.lmkd_native.critical_upgrade", "false" },
+        { "persist.device_config.lmkd_native.upgrade_pressure", "100" },
+        { "persist.device_config.lmkd_native.downgrade_pressure", "100" },
+        { "persist.device_config.lmkd_native.kill_heaviest_task", "false" },
+        { "persist.device_config.lmkd_native.kill_timeout_ms", "60000" },
+        { "persist.device_config.lmkd_native.pressure_after_kill_min_score", "1001" },
+        { "persist.device_config.lmkd_native.swap_free_low_percentage", "0" },
+        { "persist.device_config.lmkd_native.thrashing_limit", "1000000000" },
+        { "persist.device_config.lmkd_native.thrashing_limit_decay", "100" },
+        { "persist.device_config.lmkd_native.thrashing_limit_critical", "1000000000" },
+        { "persist.device_config.lmkd_native.swap_util_max", "100" },
+        { "persist.device_config.lmkd_native.psi_partial_stall_ms", "2147483647" },
+        { "persist.device_config.lmkd_native.psi_complete_stall_ms", "2147483647" },
+        { "persist.device_config.lmkd_native.stall_limit_critical", "2147483647" }
+    };
+
+    char cmd[768];
+    for (size_t i = 0; i < sizeof(guard_props) / sizeof(guard_props[0]); i++) {
+        int n = snprintf(cmd, sizeof(cmd), "%s -n '%s' '%s' 2>/dev/null",
+                         rp, guard_props[i].name, guard_props[i].value);
+        if (n < 0 || (size_t)n >= sizeof(cmd)) {
+            loge("LMKD guard: resetprop command too long for %s", guard_props[i].name);
+            continue;
+        }
+        if (system(cmd) != 0)
+            logw("LMKD guard: failed to set %s", guard_props[i].name);
+    }
+
+    /* These are generated/runtime-only values, not LMKD decision inputs. */
+    {
+        int n = snprintf(cmd, sizeof(cmd),
+                         "%s -n sys.lmk.minfree_levels '' 2>/dev/null",
+                         rp);
+        if (n >= 0 && (size_t)n < sizeof(cmd)) system(cmd);
+    }
+
+    /* Apply all staged values to the running lmkd exactly once. */
+    int n = snprintf(cmd, sizeof(cmd), "%s lmkd.reinit 1 2>/dev/null", rp);
+    if (n < 0 || (size_t)n >= sizeof(cmd)) {
+        loge("LMKD guard: reinit command buffer overflow");
+        return;
+    }
+    if (system(cmd) != 0) {
+        logw("LMKD guard: reinit request failed");
+        return;
+    }
+
+    logi("LMKD guard: stock LMKD thresholds neutralized; reinit requested");
+}
+
+/* Backward-compatible wrapper used by the existing startup path. */
 static void lmkd_minfree_cleanup(void) {
-    if (access("/system/bin/resetprop", X_OK) != 0 &&
-        access("/data/adb/magisk/resetprop", X_OK) != 0) return;
-    system("resetprop -d sys.lmk.minfree_levels 2>/dev/null; "
-           "resetprop lmkd.reinit 1 2>/dev/null");
-    logi("LMKD: cleared minfree_levels, reinit sent");
+    lmkd_neutralize_props();
 }
 
 /* ================================================================
@@ -2883,7 +2998,6 @@ static void run_daemon(void) {
     score_load();
     rank_cache_load();
     psi_check_available();
-    lmkd_minfree_cleanup();
 
     if (zram_find(g_zram_dev, sizeof(g_zram_dev), g_zram_sys, sizeof(g_zram_sys))) {
         zram_setup();
@@ -2919,6 +3033,9 @@ static void run_daemon(void) {
         g_widget_settle_until = time(NULL) + WIDGET_SETTLE_S;
         logi("Boot: widget-settle grace %ds (kills suppressed until providers loaded)", WIDGET_SETTLE_S);
     }
+
+    /* Apply LMKD guard after boot/device-config initialization, not before it. */
+    lmkd_minfree_cleanup();
 
     ProcInfo *tbl = malloc(2048 * sizeof(ProcInfo));
     if (!tbl) { loge("malloc failed"); return; }
