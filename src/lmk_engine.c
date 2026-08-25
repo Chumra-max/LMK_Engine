@@ -210,10 +210,14 @@
 /* ================================================================
  *  PROACTIVE LAUNCH TRIM
  * ================================================================ */
-#define LAUNCH_TRIM_AVAIL_PCT     FREE_HIGH_PCT  /* only trim if avail below this   */
+/* FIX 1.25a: trigger used to equal target (both FREE_HIGH_PCT=25%), which
+ * meant zero hysteresis — any switch while sitting near baseline (your
+ * device idles ~23-24% avail) tripped a trim every time. Trigger is now
+ * meaningfully lower than target so trims only fire when actually needed. */
+#define LAUNCH_TRIM_AVAIL_PCT     18  /* only trim if avail below this (was FREE_HIGH_PCT) */
 #define LAUNCH_TRIM_HEAVY_SWAP_KB (150 * 1024)   /* learned avg_swap_kb → "heavy"   */
-#define LAUNCH_TRIM_TARGET_PCT    FREE_HIGH_PCT  /* normal trim target               */
-#define LAUNCH_TRIM_HEAVY_TARGET_PCT (FREE_HIGH_PCT + 10) /* heavy-app trim target   */
+#define LAUNCH_TRIM_TARGET_PCT    22  /* normal trim target (was FREE_HIGH_PCT)      */
+#define LAUNCH_TRIM_HEAVY_TARGET_PCT 30 /* heavy-app trim target (was +10 off 25)    */
 #define LAUNCH_TRIM_WARM_SKIP_S   90  /* skip RAM trim if relaunched within this   */
 
 /* ================================================================
@@ -362,6 +366,15 @@ static time_t g_adaptive_trend_t       = 0;
 /* Idle mode tracking — updated when true-foreground app changes */
 static time_t g_last_fg_change_t = 0;
 static time_t g_screen_off_since = 0;  /* 0 = screen currently on */
+
+/* NEW 1.25: package currently in an active (PLAYING) media session, per
+ * dumpsys media_session — refreshed a few times a minute in the main loop.
+ * Empty string = nothing actively playing. This exists because the old
+ * media-player protection relied entirely on name substring matching
+ * (spotify/music/player/etc) — any app whose process name didn't contain
+ * one of those words got zero protection even while actively playing
+ * audio in the background. */
+static char g_active_audio_pkg[256] = {0};
 
 /* Latest ZRAM used% snapshot, refreshed once per main-loop tick — lets
  * AI_Swap retention (score_protect_window_ram) use spare ZRAM headroom
@@ -1015,6 +1028,66 @@ static bool is_doze_active(void) {
 }
 
 /* ================================================================
+ *  ACTIVE AUDIO SESSION DETECTION (NEW 1.25)
+ *
+ *  Old media-player protection was purely name-based (is_media_player()
+ *  substring match against spotify/music/player/audio/etc). Any player
+ *  whose process name didn't hit that list got no protection at all —
+ *  first in line for launch-trim/background kills the instant it wasn't
+ *  the foreground app, even mid-playback.
+ *
+ *  This asks Android directly who's actually playing audio right now via
+ *  dumpsys media_session, and stores that package so classify() can
+ *  protect it unconditionally — independent of its process name.
+ *
+ *  dumpsys media_session output looks roughly like:
+ *      Sessions Stack - have N sessions
+ *        ... package=com.example.app ...
+ *        ... state=PlaybackState {state=3, ... }   <- 3 == STATE_PLAYING
+ *  We track the most recently seen "package=" line and, if a PLAYING
+ *  state line follows before the next package= line, treat that package
+ *  as actively playing.
+ * ================================================================ */
+static void update_active_audio_session(void) {
+    FILE *p = popen("dumpsys media_session 2>/dev/null", "r");
+    if (!p) { g_active_audio_pkg[0] = '\0'; return; }
+
+    char line[512];
+    char cur_pkg[256] = {0};
+    char playing_pkg[256] = {0};
+
+    while (fgets(line, sizeof(line), p)) {
+        char *pkg_at = strstr(line, "package=");
+        if (pkg_at) {
+            pkg_at += 8; /* skip "package=" */
+            size_t i = 0;
+            while (pkg_at[i] && pkg_at[i] != ',' && pkg_at[i] != ' ' &&
+                   pkg_at[i] != '\n' && i < sizeof(cur_pkg) - 1) {
+                cur_pkg[i] = pkg_at[i]; i++;
+            }
+            cur_pkg[i] = '\0';
+        }
+        /* PlaybackState state=3 is STATE_PLAYING. Some Android versions
+         * print "state=PlayerState (PLAYING)" instead of the raw int —
+         * match either form. */
+        if (cur_pkg[0] &&
+            (strstr(line, "state=3") || strstr(line, "state=PlaybackState {state=3") ||
+             strstr(line, "PLAYING"))) {
+            snprintf(playing_pkg, sizeof(playing_pkg), "%s", cur_pkg);
+        }
+    }
+    pclose(p);
+
+    if (strcmp(g_active_audio_pkg, playing_pkg) != 0) {
+        if (playing_pkg[0])
+            logi("Active audio session: %s", playing_pkg);
+        else if (g_active_audio_pkg[0])
+            logi("Active audio session ended: %s", g_active_audio_pkg);
+        snprintf(g_active_audio_pkg, sizeof(g_active_audio_pkg), "%s", playing_pkg);
+    }
+}
+
+/* ================================================================
  *  LMKD GUARD / PROPERTY QUARANTINE
  *
  *  Android lmkd reads persist.device_config.lmkd_native.* first and
@@ -1139,6 +1212,41 @@ static void lmkd_neutralize_props(void) {
 /* Backward-compatible wrapper used by the existing startup path. */
 static void lmkd_minfree_cleanup(void) {
     lmkd_neutralize_props();
+}
+
+/* ================================================================
+ *  VM SYSCTL TUNING (NEW 1.25)
+ *
+ *  vfs_cache_pressure: default 100, "fair" reclaim between dentry/inode
+ *  cache and pagecache. 150 nudges it to favour reclaiming VFS metadata
+ *  cache a bit harder — keeps that cache from just piling up untouched.
+ *
+ *  watermark_scale_factor: default 10 (0.1% of RAM as the gap between
+ *  kswapd's low/high watermarks). 100 = 1% of RAM. This is the direct
+ *  fix for "apps die on switch while cache sits there untouched" — a
+ *  bigger gap means kswapd wakes up earlier and reclaims a bigger
+ *  buffer *before* an allocation has to stall/direct-reclaim/trigger a
+ *  kill. Google's own Android common-kernel patch (raising the ceiling
+ *  from 10% to 30% for GKI 5.10+) exists for exactly this reason on
+ *  low-RAM embedded devices — 100 (1%) is conservative next to that.
+ *
+ *  Applied once at daemon start, not per-loop — these aren't meant to
+ *  be reactive knobs like swappiness.
+ * ================================================================ */
+#define VM_VFS_CACHE_PRESSURE     150
+#define VM_WATERMARK_SCALE_FACTOR 100
+
+static void write_sysctl_int(const char *path, int value) {
+    FILE *f = fopen(path, "w");
+    if (!f) { logw("VM tune: failed to open %s (%s)", path, strerror(errno)); return; }
+    fprintf(f, "%d\n", value);
+    fclose(f);
+    logi("VM tune: %s = %d", path, value);
+}
+
+static void set_vm_tunables(void) {
+    write_sysctl_int("/proc/sys/vm/vfs_cache_pressure",     VM_VFS_CACHE_PRESSURE);
+    write_sysctl_int("/proc/sys/vm/watermark_scale_factor", VM_WATERMARK_SCALE_FACTOR);
 }
 
 /* ================================================================
@@ -1971,6 +2079,11 @@ static Priority classify(const ProcInfo *p) {
     if (is_launcher_like(p->name))            return PRIO_NEVER;
     if (is_ime_like(p->name))                 return PRIO_NEVER;
     if (is_active_widget_provider(p->name))   return PRIO_NEVER;
+    /* NEW 1.25: confirmed-playing audio session, regardless of process
+     * name — fixes players that don't match MEDIA_PLAYERS substrings
+     * getting killed on background/launch-trim mid-playback. */
+    if (g_active_audio_pkg[0] && strstr(p->name, g_active_audio_pkg))
+                                               return PRIO_NEVER;
     if (p->oom_adj <= 0)                      return PRIO_NEVER;
     if (p->oom_adj <= ADJ_VISIBLE_MAX)        return PRIO_SEMI_PROTECTED;
     if (is_media_player(p->name))             return PRIO_SEMI_PROTECTED;
@@ -3036,6 +3149,7 @@ static void run_daemon(void) {
 
     /* Apply LMKD guard after boot/device-config initialization, not before it. */
     lmkd_minfree_cleanup();
+    set_vm_tunables();
 
     ProcInfo *tbl = malloc(2048 * sizeof(ProcInfo));
     if (!tbl) { loge("malloc failed"); return; }
@@ -3046,10 +3160,21 @@ static void run_daemon(void) {
     time_t last_drop_caches = 0;
     useconds_t loop_sleep_us = 500000; /* adaptive: 500ms busy, up to 1.5s calm */
 
+    int audio_session_tick = 0;
+
     while (g_running) {
         usleep(loop_sleep_us);
         if (read_meminfo(&mi) < 0) continue;
         load_active_widget_pkgs();
+
+        /* NEW 1.25: must run before enumerate_procs() since classify()
+         * reads g_active_audio_pkg. Gated to every 3rd tick — dumpsys is
+         * heavier than a /proc read and playback state doesn't need
+         * per-loop freshness. */
+        if (++audio_session_tick >= 3) {
+            audio_session_tick = 0;
+            update_active_audio_session();
+        }
 
         int cnt = enumerate_procs(tbl, 2048);
         if (cnt < 0) continue;
