@@ -631,17 +631,38 @@ DEFLOG(logk,"KILL ")
  *  MEMINFO
  * ================================================================ */
 static int read_meminfo(MemInfo *m) {
-    FILE *f = fopen("/proc/meminfo","r"); if (!f) return -1;
+    int fd = open("/proc/meminfo", O_RDONLY); if (fd < 0) return -1;
     memset(m, 0, sizeof(*m));
-    char line[128]; long v;
-    while (fgets(line, sizeof(line), f)) {
-        if      (sscanf(line,"MemTotal: %ld kB",&v)==1)     m->total_kb=v;
-        else if (sscanf(line,"MemFree: %ld kB",&v)==1)      m->free_kb=v;
-        else if (sscanf(line,"MemAvailable: %ld kB",&v)==1) m->avail_kb=v;
-        else if (sscanf(line,"SwapTotal: %ld kB",&v)==1)    m->swap_total_kb=v;
-        else if (sscanf(line,"SwapFree: %ld kB",&v)==1)     m->swap_free_kb=v;
+    /* One read() into a stack buffer + prefix matching, instead of
+     * fopen()/fgets() and up to five sscanf() attempts on each of the
+     * ~50 lines. Called at least twice per tick (here and via
+     * zram_read_stats()), so the old form was a measurable share of
+     * the per-tick CPU. The five wanted keys all sit in the first
+     * ~1 KB, so parsing stops as soon as all of them have been seen. */
+    char buf[4096]; int n = 0, r;
+    while (n < (int)sizeof(buf) - 1 &&
+           (r = (int)read(fd, buf + n, sizeof(buf) - 1 - n)) > 0) n += r;
+    close(fd);
+    buf[n] = '\0';
+    unsigned got = 0;
+    for (char *line = buf; line && *line && got != 0x1F; ) {
+        char *nl = strchr(line, '\n');
+        if (nl) *nl = '\0';
+        long *dst = NULL; const char *val = NULL; unsigned bit = 0;
+        if (line[0] == 'M' && line[1] == 'e' && line[2] == 'm') {
+            if      (!strncmp(line + 3, "Total:",     6))  { dst = &m->total_kb;      val = line + 9;  bit = 1; }
+            else if (!strncmp(line + 3, "Free:",      5))  { dst = &m->free_kb;       val = line + 8;  bit = 2; }
+            else if (!strncmp(line + 3, "Available:", 10)) { dst = &m->avail_kb;      val = line + 13; bit = 4; }
+        } else if (line[0] == 'S' && !strncmp(line, "Swap", 4)) {
+            if      (!strncmp(line + 4, "Total:",     6))  { dst = &m->swap_total_kb; val = line + 10; bit = 8; }
+            else if (!strncmp(line + 4, "Free:",      5))  { dst = &m->swap_free_kb;  val = line + 9;  bit = 16; }
+        }
+        if (dst) {
+            char *e; long v = strtol(val, &e, 10);
+            if (e != val) { *dst = v; got |= bit; }
+        }
+        line = nl ? nl + 1 : NULL;
     }
-    fclose(f);
     if (m->total_kb > 0) {
         m->free_pct  = (int)(m->free_kb  * 100 / m->total_kb);
         m->avail_pct = (int)(m->avail_kb * 100 / m->total_kb);
@@ -835,9 +856,19 @@ static void proc_mem_stats(pid_t pid, long *rss, long *swap) {
     while (line && *line) {
         char *nl = strchr(line, '\n');
         if (nl) *nl = '\0';
-        long v;
-        if      (sscanf(line, "VmRSS: %ld kB", &v)  == 1) *rss  = v;
-        else if (sscanf(line, "VmSwap: %ld kB", &v) == 1) *swap = v;
+        /* Runs once per process per tick over ~50 lines each. Only
+         * "Vm*" lines can match, so test that first instead of paying
+         * two sscanf() calls for every line of the file. */
+        if (line[0] == 'V' && line[1] == 'm') {
+            char *e;
+            if (!strncmp(line + 2, "RSS:", 4)) {
+                long v = strtol(line + 6, &e, 10);
+                if (e != line + 6) *rss = v;
+            } else if (!strncmp(line + 2, "Swap:", 5)) {
+                long v = strtol(line + 7, &e, 10);
+                if (e != line + 7) *swap = v;
+            }
+        }
         line = nl ? nl + 1 : NULL;
     }
 }
@@ -5061,31 +5092,56 @@ static void ram_pressure_and_adapt(ProcInfo *tbl, int cnt,
     *loop_sleep_us = calm ? 1500000 : 500000;
 }
 
-static void fix_lmkd_psi_stall(void) {
-    FILE *fp = popen("getprop ro.lmk.psi_partial_stall_ms 2>/dev/null", "r");
-    char val[32] = {0};
-    if (fp) { if (!fgets(val, sizeof(val), fp)) val[0] = 0; pclose(fp); }
-    int len = (int)strlen(val);
-    while (len > 0 && (val[len-1] == '\n' || val[len-1] == '\r')) val[--len] = 0;
+/* AxionOS GSI "mildly aggressive" LMKD profile. These are read-only
+ * (ro.*) properties that lmkd only reads when it starts, so each one is
+ * compared against its current value, set through resetprop only if it
+ * differs, and lmkd is restarted once if anything actually changed.
+ * psi_partial_stall_ms is 170 here; it replaces the old fixed 200. */
+static const struct { const char *key; const char *val; } LMKD_PROFILE[] = {
+    { "ro.lmk.use_psi",                  "true"  },
+    { "ro.lmk.psi_partial_stall_ms",     "170"   },
+    { "ro.lmk.psi_complete_stall_ms",    "650"   },
+    { "ro.lmk.thrashing_limit",          "27"    },
+    { "ro.lmk.thrashing_limit_decay",    "50"    },
+    { "ro.lmk.swap_free_low_percentage", "12"    },
+    { "ro.lmk.kill_heaviest_task",       "false" },
+};
 
-    if (strcmp(val, "200") == 0) {
-        logi("PSItune: ro.lmk.psi_partial_stall_ms already 200ms, no action");
+static void apply_lmkd_profile(void) {
+    int changed = 0;
+    for (size_t k = 0; k < sizeof(LMKD_PROFILE) / sizeof(LMKD_PROFILE[0]); k++) {
+        const char *key = LMKD_PROFILE[k].key, *want = LMKD_PROFILE[k].val;
+        char cmd[160], val[32] = {0};
+        snprintf(cmd, sizeof(cmd), "getprop %s 2>/dev/null", key);
+        FILE *fp = popen(cmd, "r");
+        if (fp) { if (!fgets(val, sizeof(val), fp)) val[0] = 0; pclose(fp); }
+        int len = (int)strlen(val);
+        while (len > 0 && (val[len-1] == '\n' || val[len-1] == '\r')) val[--len] = 0;
+
+        if (strcmp(val, want) == 0) continue;
+
+        logi("LmkdProfile: %s=%s -> %s", key, val[0] ? val : "(unset)", want);
+        snprintf(cmd, sizeof(cmd), "resetprop %s %s 2>/dev/null", key, want);
+        if (system(cmd) != 0)
+            logw("LmkdProfile: resetprop failed for %s — is Magisk's resetprop on PATH?", key);
+        else
+            changed++;
+    }
+    if (!changed) {
+        logi("LmkdProfile: all lmkd properties already match, no action");
         return;
     }
-    logi("PSItune: ro.lmk.psi_partial_stall_ms=%s (expected 200ms low-ram "
-         "profile) — correcting and restarting lmkd to apply this boot",
-         val[0] ? val : "(unset/default 70ms high-end profile)");
-    if (system("resetprop ro.lmk.psi_partial_stall_ms 200 2>/dev/null") != 0)
-        logw("PSItune: resetprop call failed — is Magisk's resetprop on PATH?");
+    logi("LmkdProfile: %d propert%s updated — restarting lmkd to apply this boot",
+         changed, changed == 1 ? "y" : "ies");
     if (system("stop lmkd 2>/dev/null; start lmkd 2>/dev/null") != 0)
-        logw("PSItune: lmkd restart command failed — value set but not "
+        logw("LmkdProfile: lmkd restart command failed — values set but not "
              "applied until next full reboot");
 }
 
 static void run_daemon(void) {
     log_startup_banner();
     daemon_init();
-    fix_lmkd_psi_stall();
+    apply_lmkd_profile();
     wait_for_boot_settle();
 
     ProcInfo *tbl = malloc(2048 * sizeof(ProcInfo));
