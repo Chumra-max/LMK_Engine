@@ -1431,26 +1431,22 @@ static bool wait_for_next_tick(useconds_t sleep_us) {
 }
 
 /* ================================================================
- *  DYNAMIC SWAPPINESS — from reference engine concept
- *  Higher ZRAM usage → lower swappiness to preserve headroom.
+ *  FIXED SWAPPINESS
+ *  Writes SWAPPINESS_FIXED to /proc/sys/vm/swappiness once at daemon
+ *  start. Replaces the old ZRAM-%-driven 100/80/60/40/20 tier ladder,
+ *  so the value no longer moves while the daemon runs.
  * ================================================================ */
-static void update_swappiness(int zram_pct) {
+#define SWAPPINESS_FIXED 60
 
-#define SWAP_HYST 3
-    static int tier = 0; /* 0=100 1=80 2=60 3=40 4=20 */
-
-    static const int enter[]   = {  0, 60, 82, 86, 94 }; /* rising boundary into tier i */
-    static const int target[]  = {100, 80, 60, 40, 20 };
-
-    int t = tier;
-    while (t < 4 && zram_pct >= enter[t + 1] + SWAP_HYST) t++;
-    while (t > 0 && zram_pct <  enter[t]     - SWAP_HYST) t--;
-    if (t == tier) return;
-    tier = t;
-
+static void set_swappiness_fixed(void) {
     FILE *f = fopen("/proc/sys/vm/swappiness", "w");
-    if (f) { fprintf(f, "%d\n", target[tier]); fclose(f); }
-    logi("Swappiness: ZRAM=%d%% → %d (tier=%d)", zram_pct, target[tier], tier);
+    if (!f) {
+        logw("Swappiness: cannot open /proc/sys/vm/swappiness: %s", strerror(errno));
+        return;
+    }
+    fprintf(f, "%d\n", SWAPPINESS_FIXED);
+    fclose(f);
+    logi("Swappiness: fixed at %d", SWAPPINESS_FIXED);
 }
 
 /* ================================================================
@@ -4814,6 +4810,7 @@ static void daemon_init(void) {
         logw("ZRAM: no device found – running without ZRAM management");
     }
 
+    set_swappiness_fixed();
     pin_kswapd_to_little_cores();
 }
 
@@ -5154,9 +5151,6 @@ static void run_daemon(void) {
             prof_enum_ms = prof_pin_ms = prof_adapt_ms = prof_zram_ms = 0;
         }
 
-        /* ── Dynamic swappiness (reference engine hook) ── */
-        if (z.active) update_swappiness(z.used_pct);
-
         time_t now = time(NULL);
 
         unattrib_check_vanished(tbl, cnt, now);
@@ -5484,7 +5478,7 @@ int main(int argc, char *argv[]) {
                "   - Idle-deep intense sweep after 30 min continuous screen-off\n"
                "   - Futility tracking with auto-pause on repeated no-op deep cleans\n\n");
         printf("3) Other features\n"
-               "   - PSI-driven dynamic swappiness\n"
+               "   - Fixed swappiness (60), applied once at daemon start\n"
                "   - Screen-off / Doze detection feeding idle timers\n"
                "   - Widget provider protection (multi-user XML scan + cmd fallback,\n"
                "     boot-settle grace window, parse-failure resilience)\n"
